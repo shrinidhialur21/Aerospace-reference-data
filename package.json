@@ -1,0 +1,14 @@
+{
+  "name": "condense-aerospace-reference-data",
+  "version": "1.0.0",
+  "description": "Publishes aerospace master data to CDC topics for the Enrich Utility",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2",
+    "kafkajs": "^2.2.4"
+  }
+}
