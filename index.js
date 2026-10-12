@@ -15,6 +15,8 @@
  * The Enrich Utility's CDC step requires the join key to be a FIELD IN THE PAYLOAD
  * ("Join Key (CDC): field from CDC payload"), so each record repeats its key as a field.
  *
+ * Messages are wrapped in a CDC envelope ({before, after, op, ts_ms}) — see toMessage().
+ *
  * Live demo of change-data-capture:
  *   curl -X POST :3002/master/machine/ACNC_001 -H 'content-type: application/json' \
  *        -d '{"plant_code":"PLT-B7","plant_name":"Relocated Plant B7"}'
@@ -29,7 +31,17 @@ const fs        = require('fs');
 const path      = require('path');
 require('dotenv').config();
 
-const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
+// Kafka bootstrap servers: accept the common variable names and say clearly what was found.
+const BROKER_VARS = ["KAFKA_BROKERS", "KAFKA_BOOTSTRAP_SERVERS", "KAFKA_BOOTSTRAP_SERVER", "BOOTSTRAP_SERVERS", "BROKERS"];
+function resolveBrokers() {
+  const found = BROKER_VARS.find((v) => (process.env[v] || "").trim());
+  if (found) { console.log(JSON.stringify({ level: "INFO", msg: "Kafka brokers from env", var: found, brokers: process.env[found].trim() })); return process.env[found].split(",").map((s) => s.trim()); }
+  console.error(JSON.stringify({ level: "ERROR", msg: "No Kafka broker env var set — falling back to localhost:9092",
+    expected_any_of: BROKER_VARS, kafka_like_env_names_present: Object.keys(process.env).filter((k) => /kafka|broker|bootstrap/i.test(k)) }));
+  return ["localhost:9092"];
+}
+
+const KAFKA_BROKERS = resolveBrokers();
 const TOPIC_MACHINE = process.env.KAFKA_TOPIC_MACHINE_MASTER || 'aerospace-machine-master-cdc';
 const TOPIC_PROCESS = process.env.KAFKA_TOPIC_PROCESS_MASTER || 'aerospace-process-master-cdc';
 const REPUBLISH_S   = parseInt(process.env.REPUBLISH_INTERVAL_S || '60');
@@ -45,7 +57,22 @@ const TOPICS = { machine: [TOPIC_MACHINE, 'asset_id'], process: [TOPIC_PROCESS, 
 const kafka    = new Kafka({ clientId: 'aerospace-reference-data', brokers: KAFKA_BROKERS, retry: { retries: 5 } });
 const producer = kafka.producer();
 
-const toMessage = (kind, rec) => ({ key: String(rec[TOPICS[kind][1]]), value: JSON.stringify({ ...rec, record_updated_at: new Date().toISOString() }) });
+// Condense's Enrich Utility expects the CDC topic in change-data-capture envelope form
+// (Debezium-style): {"before": <old row|null>, "after": <new row>, "op": ..., "ts_ms": ...}
+// The message KEY stays the bare join key (asset_id / process_key) and is what the cache is keyed on.
+// CDC_ENVELOPE=false publishes the bare record instead; CDC_PAYLOAD_AS_STRING=true makes
+// before/after JSON *strings* rather than nested objects (in case the platform expects that).
+const ENVELOPE = process.env.CDC_ENVELOPE !== 'false';
+const PAYLOAD_AS_STRING = process.env.CDC_PAYLOAD_AS_STRING === 'true';
+const wrap = (rec) => (rec && PAYLOAD_AS_STRING ? JSON.stringify(rec) : rec);
+
+// op: 'r' = snapshot/re-publish of current state, 'u' = update (from the POST endpoints)
+const toMessage = (kind, rec, before = null, op = 'r') => ({
+  key: String(rec[TOPICS[kind][1]]),
+  value: JSON.stringify(ENVELOPE
+    ? { before: wrap(before), after: wrap(rec), op, ts_ms: Date.now(), source: { name: 'aerospace-reference-data', table: kind + '_master' } }
+    : { ...rec, record_updated_at: new Date().toISOString() }),
+});
 
 async function publishAll() {
   for (const kind of Object.keys(store)) {
@@ -68,7 +95,7 @@ for (const kind of Object.keys(store)) {
     const idField = TOPICS[kind][1];
     const next = { ...cur, ...req.body, [idField]: cur[idField] }; // join key is immutable
     store[kind].set(req.params.key, next);
-    try { await producer.send({ topic: TOPICS[kind][0], messages: [toMessage(kind, next)] }); }
+    try { await producer.send({ topic: TOPICS[kind][0], messages: [toMessage(kind, next, cur, 'u')] }); }
     catch (e) { return res.status(502).json({ error: e.message }); }
     res.json(next);
   });
